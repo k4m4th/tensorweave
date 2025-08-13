@@ -1,0 +1,16 @@
+README.md
+setup.py
+tensorweave/__init__.py
+tensorweave/tensorweave.py
+tensorweave/utils.py
+tensorweave.egg-info/PKG-INFO
+tensorweave.egg-info/SOURCES.txt
+tensorweave.egg-info/dependency_links.txt
+tensorweave.egg-info/requires.txt
+tensorweave.egg-info/top_level.txt
+tests/test_autodiff.py
+tests/test_ensemble.py
+tests/test_fit_predict.py
+tests/test_model_shapes.py
+tests/test_plotting.py
+tests/test_utils.py

@@ -1,0 +1,28 @@
+Metadata-Version: 2.1
+Name: tensorweave
+Version: 0.1.0
+Summary: Interpolating geophysical tensor fields using spatial neural networks
+Home-page: https://github.com/k4m4th/tensorweave
+Author: Akshay Kamath
+License: MIT
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Classifier: Topic :: Scientific/Engineering :: Physics
+Classifier: Intended Audience :: Science/Research
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Provides-Extra: dev
+Provides-Extra: docs
+
+# tensorweave
+
+Neural Fourier Fields for tensor interpolation (e.g., FTG), plus a small set of utilities for sampling, subsampling, spectra, and plotting — all under one namespace.
+
+---
+
+## Installation
+
+```bash
+pip install -e .
