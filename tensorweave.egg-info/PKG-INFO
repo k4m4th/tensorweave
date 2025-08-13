@@ -1,6 +1,6 @@
 Metadata-Version: 2.1
 Name: tensorweave
-Version: 0.1.0
+Version: 0.2.0
 Summary: Interpolating geophysical tensor fields using spatial neural networks
 Home-page: https://github.com/k4m4th/tensorweave
 Author: Akshay Kamath
