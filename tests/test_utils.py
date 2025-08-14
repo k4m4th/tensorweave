@@ -82,7 +82,7 @@ def test_read_and_subsample_lines(tmp_path):
     import pandas as pd
     pd.DataFrame(arr).to_csv(p, index=False, header=False, sep=" ")
 
-    out = tw.read_and_subsample_lines(str(p), column_idx=[0, 1, 2, 3], radius=10.0)
+    out = tw.read_and_subsample_lines(str(p), column_idx=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9], radius=10.0)
     # line_id + 3 coords + 6 ftg = 10 columns
     assert out.shape[1] == 10
     # fewer or equal samples than original
