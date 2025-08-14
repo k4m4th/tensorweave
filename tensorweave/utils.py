@@ -442,7 +442,7 @@ def read_and_subsample_lines(
     line_ids_norm = line_ids - np.nanmin(line_ids)
 
     xyz = arr[:, [x_col, y_col, z_col]]
-    data = np.delete(arr, [line_id_col, x_col, y_col, z_col], axis=1)
+    data = arr[:, column_idx[4:]]  # rest of the columns
 
     # group by line id
     grouped: dict[float, List[np.ndarray]] = {}
