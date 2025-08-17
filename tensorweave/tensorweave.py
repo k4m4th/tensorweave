@@ -278,11 +278,18 @@ class NeuralFourierField(nn.Module):
         grid: torch.Tensor,
         epochs: int = 250,
         loss_fn: nn.Module = nn.L1Loss(),
-        patience: int = 50,
         lr: float = 1e-4,
         lap_spacing: float | Tuple[float, float, float, int, int] = 100.0,
         lap_samples: int = 2000,
         chunk_size: int = 512,
+        # --- Early Stopping ----- #
+        mode: str = "min",
+        patience: int = 50,
+        min_delta: float = 0.002,  # 0.2% relative improvement
+        percent: bool = True,  # interpret min_delta as percentage
+        ema_alpha: float = 0.3,  # smoothing factor for early stopping
+        cooldown: int = 5,  # grace period after an improvement
+        verbose: bool = True,
         # --- plotting during training ----# 
         plot_every: int = 0,
         plotter: Optional[Callable[[torch.Tensor], None]] = None,
@@ -377,9 +384,15 @@ class NeuralFourierField(nn.Module):
         optimizer = optim.Adam(self.parameters(), lr=lr)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.8, patience=10)
 
-        best_loss = float("inf")
-        best_state = copy.deepcopy(self.state_dict())
-        no_improve_count = 0
+        # Early stopping based on unweighted loss
+        stopper = EarlyStopper(mode=mode,
+                               patience=patience,
+                               min_delta=min_delta,     # 0.2% relative improvement required
+                               percent=percent,        # interpret min_delta as %
+                               ema_alpha=ema_alpha,       # smooth metric
+                               cooldown=cooldown,          # grace period after an improvement
+                               verbose=verbose
+                               )
 
         # Pre-compute arrays for Poisson-disk sampling (on CPU as required)
         grid_np = grid.detach().cpu().numpy()
@@ -419,10 +432,20 @@ class NeuralFourierField(nn.Module):
                 known_h = all_hessians[: coords.shape[0]]               # (N, 3, 3)
                 # Flatten 3x3 -> 9 with row-major order:
                 # [xx, xy, xz, yx, yy, yz, zx, zy, zz]
-                # Select 6 independent components: [xx, xy, xz, yy, yz, zz]
+                # Select 6 components: [xx, xy, xz, yy, yz, zz]
                 known_flat = known_h.reshape(-1, 9)[:, (0, 1, 2, 4, 5, 8)]
-                data_loss = loss_fn(known_flat, data)
-                self.data_loss_history.append(float(data_loss.detach().cpu()))
+                # Split the loss into components
+                data_loss_xx = loss_fn(known_flat[:, 0], data[:, 0])
+                data_loss_xy = loss_fn(known_flat[:, 1], data[:, 1])
+                data_loss_xz = loss_fn(known_flat[:, 2], data[:, 2])
+                data_loss_yy = loss_fn(known_flat[:, 3], data[:, 3])
+                data_loss_yz = loss_fn(known_flat[:, 4], data[:, 4])
+                data_loss_zz = loss_fn(known_flat[:, 5], data[:, 5])
+                data_losses = [float(data_loss_xx.detach().cpu()), float(data_loss_xy.detach().cpu()),
+                               float(data_loss_xz.detach().cpu()), float(data_loss_yy.detach().cpu()),
+                               float(data_loss_yz.detach().cpu()), float(data_loss_zz.detach().cpu())]
+                # Store
+                self.data_loss_history.append(data_losses)
 
                 # ---- Laplacian loss on lap points ---- #
                 lap_h = all_hessians[coords.shape[0] :]
@@ -432,13 +455,21 @@ class NeuralFourierField(nn.Module):
                 self.laplacian_loss_history.append(float(laplacian_loss.detach().cpu()))
 
                 # ---- Unweighted loss for scheduling/early-stopping ---- #
-                current_loss = data_loss + laplacian_loss
+                current_loss = data_loss_xx + data_loss_xy + data_loss_xz + data_loss_yy \
+                + data_loss_yz + data_loss_zz + laplacian_loss
 
-                # ---- Dynamic weighting (normalized by sum) ---- #
-                denom = float(current_loss.detach().cpu()) + 1e-12
-                w_data = float(data_loss.detach().cpu()) / denom
-                w_lap = float(laplacian_loss.detach().cpu()) / denom
-                total_loss = data_loss * w_data + laplacian_loss * w_lap
+                # ---- Dynamic weighting (normalized by detached loss) ---- #
+                w_xx = 1 / float(data_loss_xx.detach().cpu() + 1e-12)
+                w_xy = 1 / float(data_loss_xy.detach().cpu() + 1e-12)
+                w_xz = 1 / float(data_loss_xz.detach().cpu() + 1e-12)
+                w_yy = 1 / float(data_loss_yy.detach().cpu() + 1e-12)
+                w_yz = 1 / float(data_loss_yz.detach().cpu() + 1e-12)
+                w_zz = 1 / float(data_loss_zz.detach().cpu() + 1e-12)
+                w_lap = 1 / float(laplacian_loss.detach().cpu() + 1e-12)
+                
+                # Combine
+                total_loss = data_loss_xx * w_xx + data_loss_xy * w_xy + data_loss_xz * w_xz \
+                + data_loss_yy * w_yy + data_loss_yz * w_yz + data_loss_zz + w_zz + laplacian_loss * w_lap
 
                 # ---- Backprop, step, schedule ---- #
                 total_loss.backward()
@@ -447,25 +478,21 @@ class NeuralFourierField(nn.Module):
 
                 # ---- Early stopping ---- #
                 curr = float(current_loss.cpu().detach())
-                if curr < best_loss:
-                    best_loss = curr
-                    best_state = copy.deepcopy(self.state_dict())
-                    no_improve_count = 0
-                else:
-                    no_improve_count += 1
-                    if no_improve_count >= patience:
-                        print(f"No improvement for {patience} epochs. Early stopping.")
-                        break
+                # inside the epoch loop, after computing current_loss (a Python float)
+                should_stop = stopper.step(curr, model=self, epoch=epoch)
+                if should_stop:
+                    print("Early stopping triggered.")
+                    break
 
                 # ---- Progress bar ---- #
                 bar.set_postfix(
                     {
-                        "loss": f"{curr:.6f}",
-                        "data": f"{self.data_loss_history[-1]:.6f}",
-                        "lap": f"{self.laplacian_loss_history[-1]:.6f}",
+                        "loss": f"{curr:.4f}",
+                        "ftg": "[" + ", ".join(f"{x:.3f}" for x in data_losses) + "]",
+                        "lap": f"{self.laplacian_loss_history[-1]:.3f}",
                         "lr": optimizer.param_groups[0]["lr"],
                         "lap_ns": str(self.laplacian_sample_counts[-1]),
-                        "stall": no_improve_count,
+                        "stall": stopper.bad_epochs,
                     }
                 )
 
@@ -479,7 +506,8 @@ class NeuralFourierField(nn.Module):
                     plotter(pred_hessian)
 
         # Restore best model parameters
-        self.load_state_dict(best_state)
+        if stopper.best_state is not None:
+            self.load_state_dict(stopper.best_state)
 
         # Return history arrays (N_epochs_eff x 2) and sample counts
         losses = np.c_[self.data_loss_history, self.laplacian_loss_history]
@@ -606,6 +634,85 @@ class NeuralFourierField(nn.Module):
         finally:
             # Restore prior training mode
             self.train(prior_mode)
+
+# --------------------------------------------------------------------------- #
+#                            Early Stopping                                   #
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class EarlyStopper:
+    mode: str = "min"              # or "max"
+    patience: int = 20             # bad epochs allowed
+    min_delta: float = 0.0         # threshold for a real improvement
+    percent: bool = False          # if True, min_delta is relative (%)
+    ema_alpha: float | None = 0.3  # e.g. 0.2–0.4; None = no smoothing
+    cooldown: int = 0              # epochs to ignore after an improvement
+    verbose: bool = False
+
+    # internal
+    best: float | None = None
+    smooth: float | None = None
+    bad_epochs: int = 0
+    cd_left: int = 0
+    best_state: dict | None = None
+    best_epoch: int | None = None
+
+    def _better(self, cur: float, ref: float) -> bool:
+        if self.percent:
+            # relative improvement
+            if self.mode == "min":
+                return (ref - cur) / (abs(ref) + 1e-12) > self.min_delta
+            else:
+                return (cur - ref) / (abs(ref) + 1e-12) > self.min_delta
+        else:
+            # absolute improvement
+            if self.mode == "min":
+                return (ref - cur) > self.min_delta
+            else:
+                return (cur - ref) > self.min_delta
+
+    def step(self, metric: float, model=None, epoch: int | None = None) -> bool:
+        # optional EMA smoothing
+        if self.ema_alpha is not None:
+            self.smooth = metric if self.smooth is None else (
+                self.ema_alpha * metric + (1 - self.ema_alpha) * self.smooth
+            )
+            val = self.smooth
+        else:
+            val = metric
+
+        # first value
+        if self.best is None:
+            self.best = val
+            if model is not None:
+                self.best_state = copy.deepcopy(model.state_dict())
+                self.best_epoch = epoch
+            return False
+
+        # improvement check
+        if self._better(val, self.best):
+            self.best = val
+            self.bad_epochs = 0
+            self.cd_left = self.cooldown
+            if model is not None:
+                self.best_state = copy.deepcopy(model.state_dict())
+                self.best_epoch = epoch
+            return False
+
+        # cooldown period
+        if self.cd_left > 0:
+            self.cd_left -= 1
+            return False
+
+        # count bad epoch
+        self.bad_epochs += 1
+        if self.bad_epochs > self.patience:
+            if self.verbose:
+                print(f"[EarlyStopper] stop after {self.bad_epochs} bad epochs "
+                      f"(best at {self.best_epoch}, value={self.best:.6g}).")
+            return True
+        return False
+
             
 # --------------------------------------------------------------------------- #
 #                                  Ensemble                                   #
