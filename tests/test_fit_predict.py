@@ -48,8 +48,10 @@ def test_fit_reduces_loss_and_predicts_shapes():
         coords=coords_t,
         data=data_t,
         grid=grid_t,
+        patience=50,  # early stopping patience
+        min_delta=0.002,
         epochs=500,            # short but enough to see drop
-        lr=1e-2,
+        lr=1e-3,
         lap_spacing=25.0,
         lap_samples=500,
         chunk_size=128,
@@ -59,9 +61,9 @@ def test_fit_reduces_loss_and_predicts_shapes():
 
     # Loss should drop on average
     assert losses.shape[0] >= 10
-    assert losses.shape[1] == 2
-    start = float(losses[0, 0])
-    end = float(losses[-1, 0])
+    assert losses.shape[1] == 7 # 6 hessian components + laplacian loss
+    start = float(losses[0].sum())
+    end = float(losses[-1].sum())
     assert end < start
 
     # Prediction API sanity
