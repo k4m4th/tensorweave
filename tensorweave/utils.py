@@ -90,11 +90,11 @@ def hist_equalize(
 #                          Spectral / wavenumber grids                        #
 # --------------------------------------------------------------------------- #
 
-def make_wavenumber_grids_2d(
-    spacing: float,
-    x_coords: np.ndarray,
-    y_coords: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def twod_k(inc: float,
+           x_mesh: np.ndarray,
+           y_mesh: np.ndarray
+           ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+
     """
     Build 2D angular-wavenumber grids (kx, ky) and radial magnitude (kr).
 
@@ -115,21 +115,84 @@ def make_wavenumber_grids_2d(
     kx, ky, kr : (np.ndarray, np.ndarray, np.ndarray)
         2D arrays of shape ``(ny, nx)`` suitable for broadcasting with images.
     """
-    nx = int(x_coords.shape[0])
-    ny = int(y_coords.shape[0])
-    if nx < 2 or ny < 2:
-        raise ValueError("x_coords and y_coords must have length >= 2.")
-    if spacing <= 0:
-        raise ValueError("spacing must be positive.")
 
-    fx = np.fft.fftfreq(nx, d=spacing)  # cycles / unit
-    fy = np.fft.fftfreq(ny, d=spacing)
-    kx = 2 * np.pi * fx
-    ky = 2 * np.pi * fy
-    kx_grid, ky_grid = np.meshgrid(kx, ky)  # shape (ny, nx)
-    kr = np.hypot(kx_grid, ky_grid)
-    return kx_grid, ky_grid, kr
+    kx = np.zeros_like(x_mesh)
+    ky = np.zeros_like(y_mesh)
+    nc = kx.shape[0]
+    nr = ky.shape[0]
 
+    pi = np.pi
+    td1 = 2 * pi / (inc * (nc - 1))
+    td2 = 2 * pi / (inc * (nr - 1))
+
+    for i in range(1, nc // 2 + 1):
+        kx[i - 1] = (td1 * (i))
+
+    for j in range(1, nr // 2 + 1):
+        ky[j - 1] = (td2 * (j))
+
+    for i in range(nc // 2, nc):
+        kx[i] = (td1 * (nc - i))
+
+    for j in range(nr // 2, nr):
+        ky[j] = (td2 * (nr - j))
+
+    kx_array, ky_array = np.meshgrid(kx, ky)
+    kz_array = np.sqrt(kx_array**2 + ky_array**2)
+
+    return kx_array, ky_array, kz_array
+
+# --------------------------------------------------------------------------- #
+#                          Fourier Domain Integration                         #
+# --------------------------------------------------------------------------- #
+
+def spectral_integration(ftg: np.ndarray,
+                         inc: float,
+                         x_mesh: np.ndarray,
+                         y_mesh: np.ndarray,
+                         shape: Tuple[int, int],
+                         actv: np.ndarray = None
+                         ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    
+    from numpy.fft import fft2, ifft2
+
+    # Compute the FFTS
+    # Fill the NaNs
+    ftg_filled = np.copy(ftg)
+    ftg_filled[np.isnan(ftg_filled)] = 0.
+
+    fft_field = []
+    for i in range(ftg_filled.shape[1]):
+        img_ftg = ftg_filled[:, i].reshape(shape)
+        fft_field.append(fft2(img_ftg))
+        
+    # Get the wavenumber grids
+    kx_array, ky_array, kz_array = twod_k(inc, x_mesh, y_mesh)
+
+    # Extract the fourier domain components
+    bxxf = fft_field[0]
+    bxyf = fft_field[1]
+    bxzf = fft_field[2]
+    byyf = fft_field[3]
+    byzf = fft_field[4]
+    bzzf = fft_field[5]
+
+    # Integrate
+    bxf = (-1j * kx_array * bxxf - 1j * ky_array * bxyf - 1 * kz_array * bxzf)/(4 * np.pi * kz_array**2)
+    byf = (-1j * kx_array * bxyf - 1j * ky_array * byyf - 1 * kz_array * byzf)/(4 * np.pi * kz_array**2)
+    bzf = (-1j * kx_array * bxzf - 1j * ky_array * byzf - 1 * kz_array * bzzf)/(4 * np.pi * kz_array**2)
+
+    # IFFT
+    bx = np.real(ifft2(np.nan_to_num(bxf)))
+    by = np.real(ifft2(np.nan_to_num(byf)))
+    bz = np.real(ifft2(np.nan_to_num(bzf)))
+
+    # Refill NaNs
+    bx[~actv.reshape(shape)] = np.nan
+    by[~actv.reshape(shape)] = np.nan
+    bz[~actv.reshape(shape)] = np.nan
+
+    return bx, by, bz
 
 # --------------------------------------------------------------------------- #
 #                           Sampling / point selection                        #
@@ -141,7 +204,7 @@ def poisson_disk_indices(
     radius: float,
     max_points: int,
     seed: Optional[int] = None,
-) -> np.ndarray:
+    ) -> np.ndarray:
     """
     Fast Poisson-disk sampling on an arbitrary set of (x,y) points.
 

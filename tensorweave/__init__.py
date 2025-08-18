@@ -22,7 +22,6 @@ from .tensorweave import (
 # Utils (plotting, sampling, preprocessing)
 from .utils import (
     hist_equalize,
-    make_wavenumber_grids_2d,
     poisson_disk_indices,
     poisson_disk_indices_naive,
     add_ftg_noise_by_snr,
@@ -30,6 +29,7 @@ from .utils import (
     average_within_radius,
     read_and_subsample_lines,
     plot_hessian_components,
+    spectral_integration,
 )
 
 __all__ = [
@@ -41,7 +41,6 @@ __all__ = [
     "compute_hessian_eval",
     # utils
     "hist_equalize",
-    "make_wavenumber_grids_2d",
     "poisson_disk_indices",
     "poisson_disk_indices_naive",
     "add_ftg_noise_by_snr",
@@ -49,6 +48,7 @@ __all__ = [
     "average_within_radius",
     "read_and_subsample_lines",
     "plot_hessian_components",
+    "spectral_integration",
     # aliases
     "poisson_disk_grid",
     "plot2D",
