@@ -903,7 +903,8 @@ class RFFEnsemble:
             raise RuntimeError("Ensemble has no trained members. Call fit() first.")
 
         preds = []
-        for m in self.members:
+        for i in tqdm(range(len(self.members)), desc="Evaluating: "):
+            m = self.members[i]
             y = m.predict(
                 coords=coords,
                 output=output,
