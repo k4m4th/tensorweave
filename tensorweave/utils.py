@@ -619,7 +619,8 @@ def plot_hessian_components(
 
 __all__ = [
     "hist_equalize",
-    "make_wavenumber_grids_2d",
+    "twod_k",
+    "spectral_integration",
     "poisson_disk_indices",
     "poisson_disk_indices_naive",
     "add_ftg_noise_by_snr",
