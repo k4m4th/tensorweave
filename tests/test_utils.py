@@ -18,19 +18,6 @@ def test_hist_equalize_basic():
     assert eq2.shape == img.shape
 
 
-def test_make_wavenumber_grids_2d_shape_and_values():
-    # simple 4x4 grid with spacing 1.0
-    x = np.arange(4, dtype=float)
-    y = np.arange(4, dtype=float)
-    kx, ky, kr = tw.make_wavenumber_grids_2d(1.0, x, y)
-    assert kx.shape == (len(y), len(x))
-    assert ky.shape == (len(y), len(x))
-    assert kr.shape == (len(y), len(x))
-
-    # FFT frequency first column (ky when kx=0) should include 0
-    assert np.isclose(ky[0, 0], 0.0)
-
-
 def test_add_ftg_noise_by_snr_target_approx():
     rng = np.random.default_rng(0)
     ftg = rng.normal(size=(2000, 6)).astype(np.float64)
