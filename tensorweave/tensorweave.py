@@ -20,9 +20,11 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import torch
+from torch.utils.data import TensorDataset, DataLoader
 import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
+import math
 
 # Helper functions
 from .utils import poisson_disk_indices
@@ -281,225 +283,207 @@ class NeuralFourierField(nn.Module):
         lr: float = 1e-4,
         lap_spacing: float | Tuple[float, float, float, int, int] = 100.0,
         lap_samples: int = 2000,
+        batch_size: int = 1024,       # NEW: minibatch size for (coords, data)
         chunk_size: int = 512,
         # --- Early Stopping ----- #
         mode: str = "min",
         patience: int = 50,
-        min_delta: float = 0.002,  # 0.2% relative improvement
-        percent: bool = True,  # interpret min_delta as percentage
-        ema_alpha: float = 0.3,  # smoothing factor for early stopping
-        cooldown: int = 5,  # grace period after an improvement
+        min_delta: float = 0.002,
+        percent: bool = True,
+        ema_alpha: float = 0.3,
+        cooldown: int = 5,
         verbose: bool = True,
-        # --- plotting during training ----# 
+        # --- plotting during training ----#
         plot_every: int = 0,
         plotter: Optional[Callable[[torch.Tensor], None]] = None,
         eval_grid: Optional[torch.Tensor] = None,
     ) -> Tuple[np.ndarray, List[int]]:
+
         """
-        Train the field on known FTG components with Laplacian regularization.
-
-        This routine matches selected Hessian components at provided coordinates
-        and regularizes the global solution by penalizing the Laplacian (trace
-        of the Hessian) at Poisson-disk-sampled grid points.
-
-        Losses
-        ------
-        - **Data Loss**: pointwise loss (e.g., L1) between selected Hessian
-          components and provided ``data`` for known points. We use the six
-          independent components ``[Gxx, Gxy, Gxz, Gyy, Gyz, Gzz]`` picked from
-          the flattened 3x3 Hessian.
-        - **Laplacian Loss**: mean absolute value of :math:`\\mathrm{tr}(H)` on
-          Poisson-disk samples.
-
-        Dynamic weighting balances these two losses each epoch based on their
-        relative magnitudes.
-
-        Poisson-Disk Radius Scheduling
-        ------------------------------
-        ``lap_spacing`` may be either:
-        - ``float``: fixed Poisson-disk radius.
-        - ``(r_max, r_min, decay, cycles, update_schedule)``:
-            a simple exponential schedule that cycles every
-            ``epochs/cycles`` epochs, interpolating from ``r_max``
-            to ``r_min`` with exponential decay factor ``decay``.
-            (Behavior preserved for parity with earlier code.) r is
-            updated once every ``update_schedule`` epochs.
-
-        Plotting
-        --------
-        To keep training clean, plotting is callback-based. Provide:
-        - ``plotter(pred_hessian: torch.Tensor) -> None``: a function that takes
-          the predicted Hessian on ``eval_grid`` (or ``grid`` if not provided).
-        - ``plot_every``: plot every N epochs (set 0 to disable).
-
-        Parameters
-        ----------
-        coords : torch.Tensor
-            Known coordinates of shape ``(N, input_dim)``.
-        data : torch.Tensor
-            Target FTG components at known points of shape ``(N, 6)`` in the
-            order ``[Gxx, Gxy, Gxz, Gyy, Gyz, Gzz]``.
-        grid : torch.Tensor
-            Candidate grid of shape ``(M, input_dim)`` used to sample Laplacian points.
-        epochs : int, default=250
-            Maximum training epochs.
-        loss_fn : nn.Module, default=nn.L1Loss()
-            Pointwise loss function for FTG matching.
-        patience : int, default=50
-            Early-stopping patience on the unweighted loss (data + laplacian).
-        lr : float, default=1e-4
-            Learning rate for Adam.
-        lap_spacing : float | tuple, default=100.0
-            Poisson-disk radius or scheduling tuple as described above.
-        lap_samples : int, default=2000
-            Maximum number of Poisson-disk samples per epoch.
-        chunk_size : int, default=512
-            Chunk size for Hessian computations.
-        plot_every : int, default=0
-            Plot every N epochs (0 disables plotting).
-        plotter : callable | None, default=None
-            Callback that receives predicted Hessian on ``eval_grid`` (or ``grid``).
-        eval_grid : torch.Tensor | None, default=None
-            Grid to evaluate for plotting; falls back to ``grid`` if None.
-
-        Returns
-        -------
-        (np.ndarray, list[int])
-            - Array of shape ``(epochs_eff, 2)`` with columns
-              ``[data_loss, laplacian_loss]`` per epoch.
-            - List of Laplacian sample counts per epoch.
-
-        Notes
-        -----
-        - Learning-rate scheduling uses ``ReduceLROnPlateau`` on the unweighted
-          sum of losses (data + laplacian).
-        - Early stopping also monitors this unweighted sum.
+        Minibatched training with per-minibatch optimizer steps.
+        Laplacian regularization uses a Poisson-disk pool sampled once per epoch
+        and split across steps to pair with each data minibatch.
         """
+
         self.train()
         coords = coords.to(self.device)
-        data = data.to(self.device)
-        grid = grid.to(self.device)
+        data   = data.to(self.device)
+        grid   = grid.to(self.device)
         eval_grid = (eval_grid if eval_grid is not None else grid).to(self.device)
+
+        # Data loader over known points
+        dataset = TensorDataset(coords, data)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False)
 
         optimizer = optim.Adam(self.parameters(), lr=lr)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.8, patience=10)
 
-        # Early stopping based on unweighted loss
-        stopper = EarlyStopper(mode=mode,
-                               patience=patience,
-                               min_delta=min_delta,     # 0.2% relative improvement required
-                               percent=percent,        # interpret min_delta as %
-                               ema_alpha=ema_alpha,       # smooth metric
-                               cooldown=cooldown,          # grace period after an improvement
-                               verbose=verbose
-                               )
+        stopper = EarlyStopper(
+            mode=mode,
+            patience=patience,
+            min_delta=min_delta,
+            percent=percent,
+            ema_alpha=ema_alpha,
+            cooldown=cooldown,
+            verbose=verbose,
+        )
 
-        # Pre-compute arrays for Poisson-disk sampling (on CPU as required)
+        # Precompute arrays for Poisson-disk sampling (on CPU)
         grid_np = grid.detach().cpu().numpy()
         x_vec, y_vec = grid_np[:, 0], grid_np[:, 1]
 
-        self.data_loss_history: List[float] = []
+        # Histories (epoch-level)
+        self.data_loss_history: List[List[float]] = []
         self.laplacian_loss_history: List[float] = []
         self.laplacian_sample_counts: List[int] = []
 
+        N = coords.shape[0]
+
+        from tqdm import tqdm
         with tqdm(range(epochs), desc="Training") as bar:
             for epoch in bar:
-                optimizer.zero_grad(set_to_none=True)
-
                 # ---- Determine Poisson-disk radius r ---- #
                 if isinstance(lap_spacing, tuple):
                     r_max, r_min, decay, cycles, update_schedule = lap_spacing
                     cycle_len = max(1, int(epochs / max(1, int(cycles))))
-                    # Same periodic exponential schedule as before (epoch % 20 gate kept)
                     if epoch % update_schedule == 0:
                         phase = (epoch % cycle_len) / max(1, cycle_len)
                         r = r_min + (r_max - r_min) * np.exp(-decay * phase)
+                    # else: reuse previous r (keep simple)
                 else:
                     r = float(lap_spacing)
 
-                # ---- Poisson-disk sample subset for Laplacian penalty ---- #
+                # ---- Poisson-disk sample pool for this epoch ---- #
                 lap_indices = poisson_disk_indices(x_vec, y_vec, r, lap_samples)
-                lap_sample = grid[lap_indices]
-                self.laplacian_sample_counts.append(int(lap_sample.shape[0]))
+                if lap_indices.size == 0:
+                    # fallback: no Laplacian points (shouldn't happen if r is reasonable)
+                    lap_indices = np.arange(min(lap_samples, len(grid_np)), dtype=np.int64)
+                lap_pool = grid[torch.from_numpy(lap_indices).to(self.device)]
+                self.laplacian_sample_counts.append(int(lap_pool.shape[0]))
 
-                # ---- Compute Hessian on concatenated coords (known ⊕ lap) ---- #
-                all_coords = torch.cat([coords, lap_sample], dim=0)
-                _, _, all_hessians = compute_hessian(self, all_coords,
-                                                     chunk_size=chunk_size,
-                                                     device=self.device)
+                # Split lap pool across the (expected) number of steps
+                num_steps = max(1, math.ceil(N / batch_size))
+                lap_splits_np = np.array_split(np.arange(lap_pool.shape[0]), num_steps)
+                lap_batches = [lap_pool[idx] if len(idx) > 0 else lap_pool[:0] for idx in lap_splits_np]
 
-                # ---- Data loss on known points ---- #
-                known_h = all_hessians[: coords.shape[0]]               # (N, 3, 3)
-                # Flatten 3x3 -> 9 with row-major order:
-                # [xx, xy, xz, yx, yy, yz, zx, zy, zz]
-                # Select 6 components: [xx, xy, xz, yy, yz, zz]
-                known_flat = known_h.reshape(-1, 9)[:, (0, 1, 2, 4, 5, 8)]
-                # Split the loss into components
-                data_loss_xx = loss_fn(known_flat[:, 0], data[:, 0])
-                data_loss_xy = loss_fn(known_flat[:, 1], data[:, 1])
-                data_loss_xz = loss_fn(known_flat[:, 2], data[:, 2])
-                data_loss_yy = loss_fn(known_flat[:, 3], data[:, 3])
-                data_loss_yz = loss_fn(known_flat[:, 4], data[:, 4])
-                data_loss_zz = loss_fn(known_flat[:, 5], data[:, 5])
-                data_losses = [float(data_loss_xx.detach().cpu()), float(data_loss_xy.detach().cpu()),
-                               float(data_loss_xz.detach().cpu()), float(data_loss_yy.detach().cpu()),
-                               float(data_loss_yz.detach().cpu()), float(data_loss_zz.detach().cpu())]
-                # Store
-                self.data_loss_history.append(data_losses)
+                # ---- Epoch aggregators for histories & schedulers ---- #
+                # Sum (over steps) of component means weighted by batch size to form epoch mean.
+                comp_sum = np.zeros(6, dtype=np.float64)
+                comp_count = 0
+                lap_abs_sum = 0.0
+                lap_count = 0
+                epoch_loss_accum = 0.0
+                steps_done = 0
 
-                # ---- Laplacian loss on lap points ---- #
-                lap_h = all_hessians[coords.shape[0] :]
-                # trace(H) via diagonal contraction
-                laplacian = torch.einsum("...ii->...", lap_h)
-                laplacian_loss = torch.mean(torch.abs(laplacian))
-                self.laplacian_loss_history.append(float(laplacian_loss.detach().cpu()))
+                for step_idx, (batch_coords, batch_data) in enumerate(loader):
+                    optimizer.zero_grad(set_to_none=True)
 
-                # ---- Unweighted loss for scheduling/early-stopping ---- #
-                current_loss = data_loss_xx + data_loss_xy + data_loss_xz + data_loss_yy \
-                + data_loss_yz + data_loss_zz + laplacian_loss
+                    # Pair this data minibatch with a lap minibatch
+                    lap_batch = lap_batches[step_idx % len(lap_batches)]
+                    # Concatenate coords for joint Hessian build
+                    all_coords = torch.cat([batch_coords, lap_batch], dim=0)
 
-                # ---- Dynamic weighting (normalized by detached loss) ---- #
-                w_xx = 1 / float(data_loss_xx.detach().cpu() + 1e-12)
-                w_xy = 1 / float(data_loss_xy.detach().cpu() + 1e-12)
-                w_xz = 1 / float(data_loss_xz.detach().cpu() + 1e-12)
-                w_yy = 1 / float(data_loss_yy.detach().cpu() + 1e-12)
-                w_yz = 1 / float(data_loss_yz.detach().cpu() + 1e-12)
-                w_zz = 1 / float(data_loss_zz.detach().cpu() + 1e-12)
-                w_lap = 1 / float(laplacian_loss.detach().cpu() + 1e-12)
-                
-                # Combine
-                total_loss = data_loss_xx * w_xx + data_loss_xy * w_xy + data_loss_xz * w_xz \
-                + data_loss_yy * w_yy + data_loss_yz * w_yz + data_loss_zz + w_zz + laplacian_loss * w_lap
+                    _, _, all_hessians = compute_hessian(
+                        self, all_coords, chunk_size=chunk_size, device=self.device
+                    )
 
-                # ---- Backprop, step, schedule ---- #
-                total_loss.backward()
-                optimizer.step()
-                scheduler.step(current_loss.cpu().detach())
+                    # ---- Data loss on known points (this minibatch) ---- #
+                    known_h = all_hessians[: batch_coords.shape[0]]  # (B, 3, 3)
+                    known_flat = known_h.reshape(-1, 9)[:, (0, 1, 2, 4, 5, 8)]  # [xx,xy,xz,yy,yz,zz]
 
-                # ---- Early stopping ---- #
-                curr = float(current_loss.cpu().detach())
-                # inside the epoch loop, after computing current_loss (a Python float)
-                should_stop = stopper.step(curr, model=self, epoch=epoch)
+                    data_loss_xx = loss_fn(known_flat[:, 0], batch_data[:, 0])
+                    data_loss_xy = loss_fn(known_flat[:, 1], batch_data[:, 1])
+                    data_loss_xz = loss_fn(known_flat[:, 2], batch_data[:, 2])
+                    data_loss_yy = loss_fn(known_flat[:, 3], batch_data[:, 3])
+                    data_loss_yz = loss_fn(known_flat[:, 4], batch_data[:, 4])
+                    data_loss_zz = loss_fn(known_flat[:, 5], batch_data[:, 5])
+
+                    # ---- Laplacian loss on lap points (this minibatch) ---- #
+                    lap_h = all_hessians[batch_coords.shape[0]:]
+                    if lap_h.numel() > 0:
+                        laplacian = torch.einsum("...ii->...", lap_h)
+                        laplacian_loss = torch.mean(torch.abs(laplacian))
+                    else:
+                        # If a split ended up empty, use zero contribution (rare)
+                        laplacian_loss = torch.zeros((), device=self.device)
+
+                    # ---- Unweighted current loss for schedulers (this step) ---- #
+                    current_loss_step = (
+                        data_loss_xx + data_loss_xy + data_loss_xz +
+                        data_loss_yy + data_loss_yz + data_loss_zz +
+                        laplacian_loss
+                    )
+
+                    # ---- Dynamic weighting (per-minibatch) ---- #
+                    eps = 1e-12
+                    w_xx = 1 / float(data_loss_xx.detach().cpu() + eps)
+                    w_xy = 1 / float(data_loss_xy.detach().cpu() + eps)
+                    w_xz = 1 / float(data_loss_xz.detach().cpu() + eps)
+                    w_yy = 1 / float(data_loss_yy.detach().cpu() + eps)
+                    w_yz = 1 / float(data_loss_yz.detach().cpu() + eps)
+                    w_zz = 1 / float(data_loss_zz.detach().cpu() + eps)
+                    w_lap = 1 / float(laplacian_loss.detach().cpu() + eps)
+
+                    # Get the total loss
+                    total_loss = (
+                        data_loss_xx * w_xx + data_loss_xy * w_xy + data_loss_xz * w_xz +
+                        data_loss_yy * w_yy + data_loss_yz * w_yz + data_loss_zz * w_zz +
+                        laplacian_loss * w_lap
+                    )
+
+                    # ---- Backprop + update per minibatch ---- #
+                    total_loss.backward()
+                    optimizer.step()
+
+                    # ---- Aggregate epoch stats ---- #
+                    B = batch_coords.shape[0]
+                    comp_sum += np.array([
+                        float(data_loss_xx.detach().cpu()),
+                        float(data_loss_xy.detach().cpu()),
+                        float(data_loss_xz.detach().cpu()),
+                        float(data_loss_yy.detach().cpu()),
+                        float(data_loss_yz.detach().cpu()),
+                        float(data_loss_zz.detach().cpu()),
+                    ]) * B
+                    comp_count += B
+
+                    L = int(lap_h.shape[0])
+                    lap_abs_sum += float(laplacian_loss.detach().cpu()) * max(L, 1)
+                    lap_count += max(L, 1)
+
+                    epoch_loss_accum += float(current_loss_step.detach().cpu())
+                    steps_done += 1
+
+                # ---- Epoch-end metrics ---- #
+                data_losses_epoch = (comp_sum / max(comp_count, 1)).tolist()
+                laplacian_loss_epoch = lap_abs_sum / max(lap_count, 1)
+                self.data_loss_history.append(data_losses_epoch)
+                self.laplacian_loss_history.append(laplacian_loss_epoch)
+
+                # Use the mean of per-step "current_loss" as the epoch metric
+                epoch_current_loss = epoch_loss_accum / max(steps_done, 1)
+
+                # ---- Scheduler & Early stopping (once per epoch) ---- #
+                scheduler.step(epoch_current_loss)
+                should_stop = stopper.step(epoch_current_loss, model=self, epoch=epoch)
                 if should_stop:
-                    print("Early stopping triggered.")
+                    if verbose:
+                        print("Early stopping triggered.")
+                    # break after saving best in stopper
                     break
 
                 # ---- Progress bar ---- #
-                bar.set_postfix(
-                    {
-                        "loss": f"{curr:.4f}",
-                        "ftg": "[" + ", ".join(f"{x:.3f}" for x in data_losses) + "]",
-                        "lap": f"{self.laplacian_loss_history[-1]:.3f}",
-                        "lr": optimizer.param_groups[0]["lr"],
-                        "lap_ns": str(self.laplacian_sample_counts[-1]),
-                        "stall": stopper.bad_epochs,
-                    }
-                )
+                bar.set_postfix({
+                    "loss": f"{epoch_current_loss:.4f}",
+                    "ftg": "[" + ", ".join(f"{x:.3f}" for x in data_losses_epoch) + "]",
+                    "lap": f"{laplacian_loss_epoch:.3f}",
+                    "lr": optimizer.param_groups[0]["lr"],
+                    "lap_ns": str(self.laplacian_sample_counts[-1]),
+                    "stall": stopper.bad_epochs,
+                })
 
-                # ---- Optional plotting ---- #
+                # ---- Optional plotting (epoch cadence) ---- #
                 if plotter is not None and plot_every > 0 and (epoch % plot_every == 0):
-                    # compute_hessian_eval builds second derivatives without keeping
-                    # third-order graphs and detaches CPU copies internally.
                     _, _, pred_hessian = compute_hessian_eval(
                         self, eval_grid, chunk_size=max(1024, chunk_size), device=self.device
                     )
@@ -509,9 +493,10 @@ class NeuralFourierField(nn.Module):
         if stopper.best_state is not None:
             self.load_state_dict(stopper.best_state)
 
-        # Return history arrays (N_epochs_eff x 2) and sample counts
+        # Return history arrays (N_epochs_eff x 7) -> 6 data comps + 1 laplacian
         losses = np.c_[self.data_loss_history, self.laplacian_loss_history]
         return losses, self.laplacian_sample_counts
+
     
     # ------------------------------- prediction -------------------------------- #
     
